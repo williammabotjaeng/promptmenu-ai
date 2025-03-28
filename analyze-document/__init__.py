@@ -5,7 +5,7 @@ import os
 import json
 import datetime
 from azure.core.credentials import AzureKeyCredential
-from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, generate_blob_sas
 from dotenv import load_dotenv
 
@@ -179,10 +179,10 @@ def generate_sas_url(connection_string, container_name, blob_name):
 
 def analyze_document(endpoint, key, document_url):
     """
-    Analyze a document using Azure Document Intelligence (Form Recognizer)
+    Analyze a document using Azure Document Intelligence
     """
-    # Initialize the Document Analysis Client
-    document_analysis_client = DocumentAnalysisClient(
+    # Initialize the Document Intelligence Client
+    document_analysis_client = DocumentIntelligenceClient(
         endpoint=endpoint, credential=AzureKeyCredential(key)
     )
     
@@ -200,29 +200,31 @@ def format_analysis_results(result):
     """
     # Extract key-value pairs
     key_value_pairs = {}
-    for kv_pair in result.key_value_pairs:
-        if kv_pair.key and kv_pair.value:
-            key_value_pairs[kv_pair.key.content] = kv_pair.value.content
+    if hasattr(result, 'key_value_pairs'):
+        for kv_pair in result.key_value_pairs:
+            if kv_pair.key and kv_pair.value:
+                key_value_pairs[kv_pair.key.content] = kv_pair.value.content
     
     # Extract tables (if any)
     tables = []
-    for table in result.tables:
-        table_data = {
-            "row_count": table.row_count,
-            "column_count": table.column_count,
-            "cells": []
-        }
-        
-        for cell in table.cells:
-            table_data["cells"].append({
-                "row_index": cell.row_index,
-                "column_index": cell.column_index,
-                "text": cell.content,
-                "row_span": cell.row_span,
-                "column_span": cell.column_span
-            })
-        
-        tables.append(table_data)
+    if hasattr(result, 'tables'):
+        for table in result.tables:
+            table_data = {
+                "row_count": table.row_count,
+                "column_count": table.column_count,
+                "cells": []
+            }
+            
+            for cell in table.cells:
+                table_data["cells"].append({
+                    "row_index": cell.row_index,
+                    "column_index": cell.column_index,
+                    "text": cell.content,
+                    "row_span": cell.row_span,
+                    "column_span": cell.column_span
+                })
+            
+            tables.append(table_data)
     
     # Extract document type if available
     document_type = None
@@ -242,8 +244,8 @@ def format_analysis_results(result):
     formatted_results = {
         "key_value_pairs": key_value_pairs,
         "tables": tables,
-        "pages": result.page_count,
-        "languages": [language.locale for language in result.languages],
+        "pages": result.page_count if hasattr(result, 'page_count') else 0,
+        "languages": [language.locale for language in result.languages] if hasattr(result, 'languages') else [],
         "document_type": document_type,
         "entities": entities
     }
