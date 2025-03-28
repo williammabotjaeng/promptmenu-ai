@@ -14,8 +14,6 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
         message = req_body.get('message')
-        conversation_id = req_body.get('conversation_id')
-        watermark = req_body.get('watermark')
         
         if not message:
             return func.HttpResponse(
@@ -28,97 +26,77 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400
         )
     
-    # Get Direct Line secret from environment variable
-    direct_line_secret = os.environ.get("DIRECT_LINE_SECRET")
-    if not direct_line_secret:
+    # Get Language Service API key from environment variable
+    subscription_key = os.environ.get("LANGUAGE_SERVICE_KEY")
+    if not subscription_key:
         return func.HttpResponse(
-            "DIRECT_LINE_SECRET environment variable is not configured",
+            "LANGUAGE_SERVICE_KEY environment variable is not configured",
             status_code=500
         )
     
-    # Communicate with the bot
+    # Communicate with the Language service
     try:
-        bot_responses, new_conversation_id, new_watermark = send_to_bot(
-            direct_line_secret, message, conversation_id, watermark
-        )
+        response = query_language_service(subscription_key, message)
         
+        # Check if we got a default answer (indicated by confidenceScore of 0.0)
+        is_default_answer = False
+        if response.get("answers") and response["answers"][0].get("confidenceScore") == 0.0:
+            is_default_answer = True
+            
         return func.HttpResponse(
             json.dumps({
-                "responses": bot_responses,
-                "conversation_id": new_conversation_id,
-                "watermark": new_watermark
+                "response": response,
+                "is_default_answer": is_default_answer,
+                "answer_text": response.get("answers", [{}])[0].get("answer", "No answer available")
             }),
             mimetype="application/json"
         )
     except Exception as e:
-        logging.error(f"Error communicating with bot: {str(e)}")
+        logging.error(f"Error communicating with Language service: {str(e)}")
         return func.HttpResponse(
-            f"Error communicating with bot: {str(e)}",
+            f"Error communicating with Language service: {str(e)}",
             status_code=500
         )
 
-def send_to_bot(direct_line_secret, message, conversation_id=None, watermark=None):
-    base_url = "https://directline.botframework.com/v3/directline"
+def query_language_service(subscription_key, question):
+    # Language service endpoint
+    url = "https://promptmenuqna.cognitiveservices.azure.com/language/:query-knowledgebases"
+    
+    # Request parameters
+    params = {
+        "projectName": "promptmenuhelp",
+        "api-version": "2021-10-01",
+        "deploymentName": "production"
+    }
+    
+    # Request headers
     headers = {
-        "Authorization": f"Bearer {direct_line_secret}",
+        "Ocp-Apim-Subscription-Key": subscription_key,
         "Content-Type": "application/json"
     }
     
-    # Start or continue conversation
-    if not conversation_id:
-        response = requests.post(f"{base_url}/conversations", headers=headers)
-        if response.status_code != 201:
-            raise Exception(f"Failed to create conversation: {response.text}")
-        
-        data = response.json()
-        conversation_id = data["conversationId"]
-        watermark = None
-    
-    # Send message
+    # Request payload
     payload = {
-        "type": "message",
-        "from": {"id": "user1"},
-        "text": message
+        "top": 3,
+        "question": question,
+        "includeUnstructuredSources": True,
+        "confidenceScoreThreshold": 0.3,
+        "answerSpanRequest": {
+            "enable": True,
+            "topAnswersWithSpan": 1,
+            "confidenceScoreThreshold": 0.5
+        }
     }
     
-    send_response = requests.post(
-        f"{base_url}/conversations/{conversation_id}/activities",
-        headers=headers,
-        json=payload
-    )
+    # Send request to Language service
+    response = requests.post(url, headers=headers, params=params, json=payload)
     
-    if send_response.status_code != 200 and send_response.status_code != 201:
-        raise Exception(f"Failed to send message: {send_response.text}")
+    if response.status_code != 200:
+        raise Exception(f"Failed to query Language service: {response.text}")
     
-    # Wait for a short time to allow the bot to process the message
-    import time
-    time.sleep(2)
+    # Process the response
+    response_data = response.json()
     
-    # Get response
-    get_response = requests.get(
-        f"{base_url}/conversations/{conversation_id}/activities",
-        headers=headers,
-        params={"watermark": watermark} if watermark else {}
-    )
-    
-    if get_response.status_code != 200:
-        raise Exception(f"Failed to get activities: {get_response.text}")
-    
-    activities = get_response.json().get("activities", [])
-    new_watermark = get_response.json().get("watermark")
-    
-    # Filter for bot responses that came after our message
-    bot_responses = []
-    user_message_found = False
-    
-    for activity in activities:
-        # If we find our user message, start collecting bot responses after it
-        if activity.get("from", {}).get("id") == "user1" and activity.get("text") == message:
-            user_message_found = True
-            continue
-        
-        # Collect bot responses that come after our message
-        if user_message_found and activity.get("from", {}).get("id") != "user1":
-            bot_responses.append(activity.get("text", ""))
-    
-    return bot_responses, conversation_id, new_watermark
+    # Return the full response for more detailed processing if needed
+    # This allows the client to handle default answers differently if desired
+    return response_data
