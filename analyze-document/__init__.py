@@ -3,17 +3,21 @@ import logging
 import azure.functions as func
 import os
 import json
+import re
 import datetime
+import uuid
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 from azure.storage.blob import BlobServiceClient, BlobSasPermissions, generate_blob_sas
+from pymongo import MongoClient
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Python HTTP trigger function for media blob upload and document analysis.')
+    logging.info('Python HTTP trigger function for receipt and bill analysis.')
     
     try:
         # Check if the request contains a file upload
@@ -36,11 +40,19 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         file_name = file_data.filename
         file_content = file_data.read()
         
-        # Get any form data as metadata
+        # Extract user info from form data
+        user_info = {}
         metadata = {}
+        
+        # Process form fields
         for key in req.form:
             if key != 'file':
-                metadata[key] = req.form[key]
+                # User info fields
+                if key in ['owner', 'displayName', 'fullName', 'email', 'userId', 'restaurant']:
+                    user_info[key] = req.form[key]
+                # Metadata fields
+                else:
+                    metadata[key] = req.form[key]
         
         # Get Document Intelligence credentials
         endpoint = os.environ.get("DOCUMENT_INTELLIGENCE_ENDPOINT")
@@ -48,7 +60,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         
         # Get Blob Storage credentials
         blob_connection_string = os.environ.get("BLOB_STORAGE_CONNECTION_STRING")
-        container_name = os.environ.get("BLOB_CONTAINER_NAME", "documents")
+        container_name = os.environ.get("BLOB_CONTAINER_NAME", "receipts")
         
         # Check for missing required configuration
         missing_config = []
@@ -87,13 +99,126 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # Analyze the document
         result = analyze_document(endpoint, key, sas_url)
         
+        # Extract raw documents
+        raw_documents = None
+        if hasattr(result, 'documents') and result.documents:
+            # Print raw documents for debugging
+            print(f"Result documents: {result.documents}")
+            
+            # Extract raw document data as a list of dictionaries
+            raw_docs_list = []
+            for doc in result.documents:
+                doc_dict = {}
+                # Get doc_type and confidence if available
+                doc_dict["doc_type"] = doc.doc_type if hasattr(doc, "doc_type") else None
+                doc_dict["confidence"] = doc.confidence if hasattr(doc, "confidence") else None
+                
+                # Extract fields if available
+                if hasattr(doc, "fields"):
+                    fields_dict = {}
+                    for field_name, field in doc.fields.items():
+                        # Create field data dictionary
+                        field_dict = {
+                            "value_type": field.value_type if hasattr(field, "value_type") else None,
+                            "confidence": field.confidence if hasattr(field, "confidence") else None
+                        }
+                        
+                        # Extract value based on value_type
+                        if hasattr(field, "value_type"):
+                            if field.value_type == "string" and hasattr(field, "value_string"):
+                                field_dict["value"] = field.value_string
+                            elif field.value_type == "number" and hasattr(field, "value_number"):
+                                field_dict["value"] = field.value_number
+                            elif field.value_type == "integer" and hasattr(field, "value_integer"):
+                                field_dict["value"] = field.value_integer
+                            elif field.value_type == "date" and hasattr(field, "value_date"):
+                                field_dict["value"] = str(field.value_date)
+                            elif field.value_type == "time" and hasattr(field, "value_time"):
+                                field_dict["value"] = str(field.value_time)
+                            elif field.value_type == "phoneNumber" and hasattr(field, "value_phone_number"):
+                                field_dict["value"] = field.value_phone_number
+                            elif field.value_type == "selectionMark" and hasattr(field, "value_selection_mark"):
+                                field_dict["value"] = field.value_selection_mark
+                            elif field.value_type == "countryRegion" and hasattr(field, "value_country_region"):
+                                field_dict["value"] = field.value_country_region
+                            elif field.value_type == "array" and hasattr(field, "value_array"):
+                                # Handle arrays (like items in a receipt)
+                                items_list = []
+                                for item in field.value_array:
+                                    if hasattr(item, "value_type") and item.value_type == "object" and hasattr(item, "value_object"):
+                                        item_dict = {}
+                                        for item_field_name, item_field in item.value_object.items():
+                                            # Include field content and value
+                                            item_dict[item_field_name] = {
+                                                "content": item_field.content if hasattr(item_field, "content") else None
+                                            }
+                                            
+                                            # Get the typed value
+                                            if hasattr(item_field, "value_type"):
+                                                value_attr = f"value_{item_field.value_type}"
+                                                if hasattr(item_field, value_attr):
+                                                    value = getattr(item_field, value_attr)
+                                                    # Handle date objects
+                                                    if hasattr(value, "isoformat"):
+                                                        item_dict[item_field_name]["value"] = value.isoformat()
+                                                    else:
+                                                        item_dict[item_field_name]["value"] = value
+                                        
+                                        items_list.append(item_dict)
+                                
+                                field_dict["items"] = items_list
+                        
+                        # Add content when available
+                        if hasattr(field, "content"):
+                            field_dict["content"] = field.content
+                        
+                        fields_dict[field_name] = field_dict
+                    
+                    doc_dict["fields"] = fields_dict
+                
+                raw_docs_list.append(doc_dict)
+            
+            raw_documents = raw_docs_list
+        
+        # Save to database
+        db_response = save_raw_documents_to_db(
+            blob_client.blob_name,
+            blob_url,
+            sas_url,
+            user_info,
+            metadata,
+            raw_documents
+        )
+        
+        # Determine receipt type for response
+        receipt_type = "unknown"
+        if raw_documents and len(raw_documents) > 0:
+            doc_type = raw_documents[0].get("doc_type")
+            if doc_type == "receipt":
+                receipt_type = "receipt"
+                # Check if it might be a restaurant bill
+                if "fields" in raw_documents[0]:
+                    fields = raw_documents[0]["fields"]
+                    # Check for restaurant indicators
+                    if "MerchantName" in fields:
+                        merchant = fields["MerchantName"].get("value", "").lower() if isinstance(fields["MerchantName"].get("value"), str) else ""
+                        if any(keyword in merchant for keyword in ["restaurant", "cafe", "bar", "grill"]):
+                            receipt_type = "restaurant_bill"
+                    # Check for tip field (common in restaurant bills)
+                    if "Tip" in fields or "ServiceCharge" in fields:
+                        receipt_type = "restaurant_bill"
+            elif doc_type == "invoice":
+                receipt_type = "invoice"
+        
         # Prepare the response
         response_data = {
-            "message": "Document processed successfully",
+            "message": "Receipt processed successfully",
             "blob_name": blob_client.blob_name,
             "blob_url": blob_url,
-            "sas_url": sas_url,
-            "analysis_results": format_analysis_results(result)
+            "document_key": db_response["document_key"],
+            "document_id": db_response["id"],
+            "receipt_type": receipt_type,
+            "raw_document_count": len(raw_documents) if raw_documents else 0
         }
         
         return func.HttpResponse(
@@ -126,7 +251,7 @@ def upload_to_blob_storage(connection_string, container_name, file_name, file_co
     # Extract file extension
     file_extension = os.path.splitext(file_name)[1] if '.' in file_name else ''
     # Create a unique blob name
-    blob_name = f"{os.path.splitext(file_name)[0]}_{timestamp}{file_extension}"
+    blob_name = f"receipt_{timestamp}{file_extension}"
     
     # Initialize the BlobServiceClient
     blob_service_client = BlobServiceClient.from_connection_string(connection_string)
@@ -186,68 +311,167 @@ def analyze_document(endpoint, key, document_url):
         endpoint=endpoint, credential=AzureKeyCredential(key)
     )
     
-    # Start the document analysis (this uses the prebuilt-document model)
-    poller = document_analysis_client.begin_analyze_document_from_url("prebuilt-document", document_url)
+    # Log available methods for debugging
+    methods = [method for method in dir(document_analysis_client) if method.startswith('begin_analyze')]
+    logging.info(f"Available analyze methods: {methods}")
+    
+    # Try to analyze with different model types based on availability, prioritizing receipt models
+    try:
+        # First try the prebuilt-receipt model (best for receipts)
+        analyze_request = AnalyzeDocumentRequest(url_source=document_url)
+        poller = document_analysis_client.begin_analyze_document(
+            "prebuilt-receipt", analyze_request
+        )
+        logging.info("Using prebuilt-receipt model")
+    except Exception as e1:
+        logging.warning(f"Receipt model failed: {str(e1)}")
+        try:
+            # Try the prebuilt-invoice model (good for restaurant bills)
+            analyze_request = AnalyzeDocumentRequest(url_source=document_url)
+            poller = document_analysis_client.begin_analyze_document(
+                "prebuilt-invoice", analyze_request
+            )
+            logging.info("Using prebuilt-invoice model")
+        except Exception as e2:
+            logging.warning(f"Invoice model failed: {str(e2)}")
+            try:
+                # Try the prebuilt-document model
+                analyze_request = AnalyzeDocumentRequest(url_source=document_url)
+                poller = document_analysis_client.begin_analyze_document(
+                    "prebuilt-document", analyze_request
+                )
+                logging.info("Using prebuilt-document model")
+            except Exception as e3:
+                logging.warning(f"Document model failed: {str(e3)}")
+                # Fall back to layout model
+                analyze_request = AnalyzeDocumentRequest(url_source=document_url)
+                poller = document_analysis_client.begin_analyze_document(
+                    "prebuilt-layout", analyze_request
+                )
+                logging.info("Using prebuilt-layout model")
     
     # Wait for the analysis to complete and get the result
     result = poller.result()
     
     return result
 
-def format_analysis_results(result):
+def save_raw_documents_to_db(blob_name, blob_url, sas_url, user_info, metadata, raw_documents):
     """
-    Format the analysis results for easier consumption
+    Save the raw documents directly to the database without complex processing
     """
-    # Extract key-value pairs
-    key_value_pairs = {}
-    if hasattr(result, 'key_value_pairs'):
-        for kv_pair in result.key_value_pairs:
-            if kv_pair.key and kv_pair.value:
-                key_value_pairs[kv_pair.key.content] = kv_pair.value.content
+    # Create timestamp
+    timestamp = datetime.datetime.utcnow()
     
-    # Extract tables (if any)
-    tables = []
-    if hasattr(result, 'tables'):
-        for table in result.tables:
-            table_data = {
-                "row_count": table.row_count,
-                "column_count": table.column_count,
-                "cells": []
-            }
-            
-            for cell in table.cells:
-                table_data["cells"].append({
-                    "row_index": cell.row_index,
-                    "column_index": cell.column_index,
-                    "text": cell.content,
-                    "row_span": cell.row_span,
-                    "column_span": cell.column_span
-                })
-            
-            tables.append(table_data)
+    # Generate a simple document key
+    receipt_type = "receipt"
+    if raw_documents and len(raw_documents) > 0 and raw_documents[0].get("doc_type"):
+        if raw_documents[0]["doc_type"] == "receipt":
+            receipt_type = "receipt"
+        elif raw_documents[0]["doc_type"] == "invoice":
+            receipt_type = "invoice"
     
-    # Extract document type if available
-    document_type = None
-    if hasattr(result, 'document_type') and result.document_type:
-        document_type = result.document_type
+    # Get username if available
+    username = "unknown"
+    if user_info:
+        if user_info.get("displayName"):
+            username = user_info.get("displayName")
+        elif user_info.get("fullName"):
+            username = user_info.get("fullName")
+        elif user_info.get("owner"):
+            username = user_info.get("owner")
+        
+        username = convert_to_snake_case(username)
     
-    # Extract entities if available
-    entities = []
-    if hasattr(result, 'entities'):
-        for entity in result.entities:
-            entities.append({
-                "category": entity.category,
-                "content": entity.content
-            })
+    doc_key = f"{receipt_type}_{username}_{timestamp.strftime('%Y%m%d%H%M%S')}"
     
-    # Prepare the formatted results
-    formatted_results = {
-        "key_value_pairs": key_value_pairs,
-        "tables": tables,
-        "pages": result.page_count if hasattr(result, 'page_count') else 0,
-        "languages": [language.locale for language in result.languages] if hasattr(result, 'languages') else [],
-        "document_type": document_type,
-        "entities": entities
+    # Create a document record with raw data
+    record = {
+        "_id": str(uuid.uuid4()),
+        "document_key": doc_key,
+        "blob_name": blob_name,
+        "blob_url": blob_url,
+        "sas_url": sas_url,  # Store SAS URL (note: this will expire)
+        "upload_timestamp": timestamp.isoformat(),
+        "receipt_type": receipt_type,
+        "user_info": user_info or {},
+        "metadata": metadata or {},
+        "raw_documents": raw_documents or []
     }
     
-    return formatted_results
+    # Extract some key information from raw documents if available
+    if raw_documents and len(raw_documents) > 0 and "fields" in raw_documents[0]:
+        fields = raw_documents[0]["fields"]
+        
+        # Extract merchant name
+        if "MerchantName" in fields:
+            merchant_info = fields["MerchantName"]
+            if "value" in merchant_info:
+                record["merchant"] = merchant_info["value"]
+        elif "VendorName" in fields:
+            vendor_info = fields["VendorName"]
+            if "value" in vendor_info:
+                record["merchant"] = vendor_info["value"]
+        
+        # Extract total
+        if "Total" in fields:
+            total_info = fields["Total"]
+            if "value" in total_info:
+                record["total"] = total_info["value"]
+        elif "InvoiceTotal" in fields:
+            total_info = fields["InvoiceTotal"]
+            if "value" in total_info:
+                record["total"] = total_info["value"]
+        
+        # Extract date
+        if "TransactionDate" in fields:
+            date_info = fields["TransactionDate"]
+            if "value" in date_info:
+                record["date"] = date_info["value"]
+        elif "InvoiceDate" in fields:
+            date_info = fields["InvoiceDate"]
+            if "value" in date_info:
+                record["date"] = date_info["value"]
+    
+    # Connect to the database and save
+    try:
+        # Get Cosmos DB/MongoDB connection
+        load_dotenv()
+        cosmos_db_connection_string = os.environ.get("COSMOS_DB_CONNECTION_STRING")
+        database_name = os.environ.get("DATABASE_NAME", "ReceiptDatabase")
+        container_name = os.environ.get("CONTAINER_NAME", "Receipts")
+        
+        # Connect to database
+        client = MongoClient(
+            cosmos_db_connection_string,
+            socketTimeoutMS=60000,
+            connectTimeoutMS=60000
+        )
+        
+        # Get database and collection
+        database = client[database_name]
+        collection = database[container_name]
+        
+        # Insert document
+        result = collection.insert_one(record)
+        
+        return {
+            "id": str(result.inserted_id),
+            "document_key": doc_key,
+            "status": "saved"
+        }
+    
+    except Exception as e:
+        logging.error(f"Error saving to database: {str(e)}")
+        raise
+
+def convert_to_snake_case(text):
+    """
+    Convert a display name or text to snake_case format
+    Example: "John Doe" -> "john_doe"
+    """
+    # Replace spaces and special characters with underscores
+    s1 = re.sub(r'[^\w\s]', '_', str(text))
+    # Replace one or more spaces with a single underscore
+    s2 = re.sub(r'\s+', '_', s1)
+    # Convert to lowercase
+    return s2.lower()
